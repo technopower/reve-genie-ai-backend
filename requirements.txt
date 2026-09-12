@@ -3,3 +3,4 @@ uvicorn[standard]
 python-multipart
 azure-cognitiveservices-speech
 openai
+python-dotenv
