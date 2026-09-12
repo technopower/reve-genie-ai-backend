@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
 python-multipart
+python-dotenv
 azure-cognitiveservices-speech
 openai
-python-dotenv
