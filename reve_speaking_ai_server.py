@@ -1,6 +1,8 @@
 import os
 import json
 import tempfile
+import logging
+import traceback
 from typing import Any
 
 from dotenv import load_dotenv
@@ -10,7 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import azure.cognitiveservices.speech as speechsdk
 from openai import OpenAI
 
-# Load .env from the same folder as this Python file.
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
@@ -19,7 +23,10 @@ AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
-app = FastAPI(title="REVE Speaking AI", version="1.0.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("reve-speaking-ai")
+
+app = FastAPI(title="REVE Speaking AI", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,13 +64,15 @@ def safe_json(text: str) -> dict:
         text = "\n".join(lines).strip()
 
     try:
-        return json.loads(text)
+        value = json.loads(text)
+        return value if isinstance(value, dict) else {}
     except Exception:
         start = text.find("{")
         end = text.rfind("}")
         if start >= 0 and end > start:
             try:
-                return json.loads(text[start:end + 1])
+                value = json.loads(text[start:end + 1])
+                return value if isinstance(value, dict) else {}
             except Exception:
                 pass
 
@@ -78,13 +87,12 @@ def azure_pronunciation_assessment(
     if not azure_is_configured():
         raise RuntimeError("Azure Speech is not configured.")
 
+    logger.info("Starting Azure pronunciation assessment. language=%s", language)
+
     speech_config = speechsdk.SpeechConfig(
         subscription=AZURE_SPEECH_KEY,
         region=AZURE_SPEECH_REGION,
     )
-
-    # Pronunciation Assessment is intended for speech/language learning.
-    # The current backend expects an English reference sentence.
     speech_config.speech_recognition_language = language or "en-US"
 
     audio_config = speechsdk.audio.AudioConfig(filename=audio_path)
@@ -96,17 +104,15 @@ def azure_pronunciation_assessment(
         enable_miscue=True,
     )
 
-    # Prosody is supported on SDK versions that expose this property.
     try:
         pronunciation_config.enable_prosody_assessment()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.info("Prosody assessment not enabled: %s", exc)
 
     recognizer = speechsdk.SpeechRecognizer(
         speech_config=speech_config,
         audio_config=audio_config,
     )
-
     pronunciation_config.apply_to(recognizer)
 
     result = recognizer.recognize_once()
@@ -115,9 +121,11 @@ def azure_pronunciation_assessment(
         cancellation = getattr(result, "cancellation_details", None)
         reason = getattr(cancellation, "reason", "Speech recognition failed")
         details = getattr(cancellation, "error_details", "")
-        raise RuntimeError(f"{reason}. {details}".strip())
+        logger.error("Azure recognition failed: reason=%s details=%s", reason, details)
+        raise RuntimeError(f"Azure Speech recognition failed: {reason}. {details}".strip())
 
     transcript = result.text or ""
+    logger.info("Azure transcript received. length=%d", len(transcript))
 
     raw_json = {}
     try:
@@ -127,29 +135,23 @@ def azure_pronunciation_assessment(
                 "{}",
             )
         )
-    except Exception:
-        raw_json = {}
+    except Exception as exc:
+        logger.info("Could not parse Azure JSON result: %s", exc)
 
     pronunciation_result = {}
     try:
-        pronunciation_result = json.loads(
-            result.properties.get(
-                speechsdk.PropertyId.SpeechServiceResponse_JsonResult,
-                "{}",
-            )
-        ).get("NBest", [{}])[0].get("PronunciationAssessment", {})
+        pronunciation_result = raw_json.get("NBest", [{}])[0].get(
+            "PronunciationAssessment", {}
+        )
     except Exception:
         pronunciation_result = {}
 
-    # Azure's pronunciation values may also be available in the result JSON.
     accuracy = clamp_score(pronunciation_result.get("AccuracyScore", 0))
     fluency = clamp_score(pronunciation_result.get("FluencyScore", 0))
     completeness = clamp_score(pronunciation_result.get("CompletenessScore", 0))
     prosody = clamp_score(pronunciation_result.get("ProsodyScore", 0))
 
     pronunciation_score = accuracy
-
-    # Keep pronunciation meaningful even when prosody is unavailable.
     if prosody > 0:
         pronunciation_score = round((accuracy * 0.8) + (prosody * 0.2))
 
@@ -164,19 +166,18 @@ def azure_pronunciation_assessment(
     }
 
 
-def openai_language_evaluation(
-    reference_text: str,
-    transcript: str,
-) -> dict:
+def openai_language_evaluation(reference_text: str, transcript: str) -> dict:
     if not openai_is_configured():
         return {
             "corrected_sentence": "",
             "grammar_score": 0,
             "vocabulary_score": 0,
             "feedback": "OpenAI evaluation is not configured yet.",
-            "next_practice": "Configure OPENAI_API_KEY in .env.",
+            "next_practice": "Configure OPENAI_API_KEY.",
             "mistakes": [],
         }
+
+    logger.info("Starting OpenAI language evaluation. model=%s", OPENAI_MODEL)
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -225,6 +226,8 @@ Keep feedback concise and useful for a language learner.
     content = response.choices[0].message.content or "{}"
     data = safe_json(content)
 
+    logger.info("OpenAI evaluation completed.")
+
     return {
         "corrected_sentence": str(data.get("corrected_sentence", "")),
         "grammar_score": clamp_score(data.get("grammar_score", 0)),
@@ -235,6 +238,11 @@ Keep feedback concise and useful for a language learner.
         if isinstance(data.get("mistakes", []), list)
         else [],
     }
+
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "REVE Speaking AI"}
 
 
 @app.get("/health")
@@ -255,36 +263,38 @@ async def evaluate_speaking(
     language: str = Form("en-US"),
 ):
     if not reference_text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="reference_text is required.",
-        )
+        raise HTTPException(status_code=400, detail="reference_text is required.")
 
     if not azure_is_configured():
         raise HTTPException(
             status_code=503,
-            detail="Azure Speech is not configured. Check .env.",
+            detail="Azure Speech is not configured. Check Render Environment Variables.",
         )
 
     suffix = os.path.splitext(audio.filename or "")[1] or ".wav"
     temp_path = ""
+    stage = "starting"
 
     try:
+        stage = "reading_audio"
         audio_bytes = await audio.read()
 
         if not audio_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail="Audio file is empty.",
-            )
+            raise HTTPException(status_code=400, detail="Audio file is empty.")
 
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=suffix,
-        ) as temp:
+        logger.info(
+            "Received audio: filename=%s bytes=%d content_type=%s",
+            audio.filename,
+            len(audio_bytes),
+            audio.content_type,
+        )
+
+        stage = "saving_audio"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
             temp.write(audio_bytes)
             temp_path = temp.name
 
+        stage = "azure_pronunciation"
         azure_result = azure_pronunciation_assessment(
             audio_path=temp_path,
             reference_text=reference_text.strip(),
@@ -293,20 +303,22 @@ async def evaluate_speaking(
 
         transcript = azure_result["transcript"]
 
+        if not transcript.strip():
+            raise RuntimeError(
+                "Azure returned no transcript. Make sure the recording contains clear English speech."
+            )
+
+        stage = "openai_language"
         ai_result = openai_language_evaluation(
             reference_text=reference_text.strip(),
             transcript=transcript,
         )
 
-        pronunciation = clamp_score(
-            azure_result.get("pronunciation_score", 0)
-        )
+        pronunciation = clamp_score(azure_result.get("pronunciation_score", 0))
         grammar = clamp_score(ai_result.get("grammar_score", 0))
         vocabulary = clamp_score(ai_result.get("vocabulary_score", 0))
         fluency = clamp_score(azure_result.get("fluency_score", 0))
 
-        # Genuine overall score from actual Azure pronunciation/fluency
-        # plus OpenAI grammar/vocabulary evaluation.
         overall = round(
             pronunciation * 0.45
             + grammar * 0.25
@@ -314,6 +326,7 @@ async def evaluate_speaking(
             + fluency * 0.10
         )
 
+        stage = "completed"
         return {
             "ok": True,
             "transcript": transcript,
@@ -335,9 +348,12 @@ async def evaluate_speaking(
     except HTTPException:
         raise
     except Exception as exc:
+        # IMPORTANT: Never log or return API keys.
+        logger.error("Speaking evaluation failed at stage=%s: %s", stage, exc)
+        logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=500,
-            detail=f"Speaking evaluation failed: {str(exc)}",
+            detail=f"Speaking evaluation failed at stage '{stage}': {type(exc).__name__}: {str(exc)}",
         )
     finally:
         if temp_path:
@@ -349,7 +365,6 @@ async def evaluate_speaking(
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(
         "reve_speaking_ai_server:app",
         host="0.0.0.0",
